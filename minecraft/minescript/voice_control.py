@@ -10,6 +10,42 @@ emergency_stop, interrupt_signal = threading.Event(), threading.Event()
 # Track active tool tasks
 active_tool_tasks = set()
 
+def get_nearby_interesting_blocks():
+    try:
+        px, py, pz = [int(v) for v in m.player_position()]
+        radius = 10
+        positions = []
+        for x in range(px-radius, px+radius):
+            for z in range(pz-radius, pz+radius):
+                for y in range(py-1, py+6):
+                    positions.append([x, y, z])
+        
+        block_types = m.getblocklist(positions)
+        unique_blocks = set()
+        boring = {"minecraft:air", "minecraft:cave_air", "minecraft:grass_block", "minecraft:dirt", "minecraft:stone", "minecraft:water", "minecraft:lava", "minecraft:tall_grass", "minecraft:grass", "minecraft:poppy", "minecraft:dandelion", "minecraft:oak_leaves", "minecraft:birch_leaves", "minecraft:spruce_leaves", "minecraft:jungle_leaves", "minecraft:acacia_leaves", "minecraft:dark_oak_leaves", "minecraft:mangrove_leaves", "minecraft:cherry_leaves", "minecraft:azalea_leaves", "minecraft:flowering_azalea_leaves"}
+        
+        for b in block_types:
+            if b.lower() not in boring:
+                name = b.lower().replace("minecraft:", "")
+                unique_blocks.add(name)
+        
+        return sorted(list(unique_blocks))
+    except Exception as e:
+        m.log(f"Initial Scan Error: {e}")
+        return []
+
+def do_equip(item_name):
+    m.echo(f"§7Equipping {item_name}...")
+    inventory = m.player_inventory()
+    for item in inventory:
+        if item.slot is not None and 0 <= item.slot <= 8:
+            if item_name.lower() in item.item.lower():
+                m.player_inventory_select_slot(item.slot)
+                m.echo(f"§aEquipped {item.item}")
+                return True
+    m.echo(f"§cCould not find {item_name} in hotbar")
+    return False
+
 def monitor_emergency_stop():
     try:
         with m.EventQueue() as eq:
@@ -66,8 +102,8 @@ def do_chop(tx, ty, tz, duration=5.0):
     ix, iy, iz = int(tx), int(ty), int(tz)
     # Check if block still exists
     block = m.getblock(ix, iy, iz).lower()
-    if "log" not in block and "wood" not in block and "stem" not in block:
-        m.echo(f"§7Block at {ix},{iy},{iz} is gone. Skipping.")
+    if "air" in block:
+        m.echo(f"§7Block at {ix},{iy},{iz} is already gone. Skipping.")
         return
 
     m.echo(f"§6Chopping block at {ix}, {iy}, {iz}...")
@@ -87,8 +123,9 @@ def do_chop(tx, ty, tz, duration=5.0):
     m.player_press_attack(False)
     m.echo("§aChop complete.")
 
-def find_blocks():
+def find_blocks(query):
     try:
+        query = query.lower().replace(" ", "_")
         px, py, pz = [int(v) for v in m.player_position()]
         radius = 10
         found_blocks = []
@@ -101,11 +138,11 @@ def find_blocks():
         block_types = m.getblocklist(positions)
         for i, b_type in enumerate(block_types):
             b_lower = b_type.lower()
-            if "log" in b_lower or "wood" in b_lower or "stem" in b_lower:
+            if query in b_lower:
                 found_blocks.append({"x": positions[i][0], "y": positions[i][1], "z": positions[i][2]})
         
         sorted_blocks = sorted(found_blocks, key=lambda t: (t['x']-px)**2 + (t['y']-py)**2 + (t['z']-pz)**2)
-        m.echo(f"§bDetected {len(sorted_blocks)} blocks.")
+        m.echo(f"§bDetected {len(sorted_blocks)} blocks matching '{query}'.")
         return sorted_blocks[:15]
     except Exception as e:
         m.log(f"Scan Error: {e}")
@@ -115,19 +152,30 @@ async def audio_stream_task(session):
     p = pyaudio.PyAudio()
     try:
         stream = p.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK)
+        m.log("Audio: Stream opened.")
         while not emergency_stop.is_set():
-            data = stream.read(CHUNK, exception_on_overflow=False)
+            data = await asyncio.to_thread(stream.read, CHUNK, exception_on_overflow=False)
+            if not data:
+                m.log("Audio: No data read from stream.")
+                continue
             await session.send_realtime_input(audio=types.Blob(data=data, mime_type="audio/pcm;rate=16000"))
-            await asyncio.sleep(0)
-    except: pass
-    finally: p.terminate()
+    except Exception as e:
+        m.log(f"Audio Error: {e}")
+        m.echo(f"§cAudio Error: {e}")
+    finally:
+        m.log("Audio: Terminating stream.")
+        p.terminate()
 
 async def handle_tool_call(session, fc, aq):
     name, args, call_id = fc.name, fc.args, fc.id
     res_body = {"status": "ok"}
     try:
         if name == "find_nearby_blocks":
-            res_body["blocks"] = find_blocks()
+            res_body["blocks"] = find_blocks(args.get('block_type', 'log'))
+        elif name == "equip_item":
+            fut = asyncio.get_event_loop().create_future()
+            await aq.put((do_equip, (args['item_name'],), {}, fut))
+            await fut
         elif name == "move_to":
             fut = asyncio.get_event_loop().create_future()
             await aq.put((do_move_to, (args['x'], args['y'], args['z']), {}, fut))
@@ -143,6 +191,7 @@ async def handle_tool_call(session, fc, aq):
                 try: aq.get_nowait(); aq.task_done()
                 except asyncio.QueueEmpty: break
     except asyncio.CancelledError:
+        # Don't send responses for cancelled tasks as the turn is likely already gone.
         return
     except Exception as e:
         res_body = {"status": "error", "message": str(e)}
@@ -155,6 +204,7 @@ async def receive_from_gemini(session, aq):
     m.log("Receiver: Loop started.")
     try:
         async for response in session.receive():
+            m.log(f"Receiver: Data received: server_content={bool(response.server_content)}, tool_call={bool(response.tool_call)}")
             if response.server_content:
                 if response.server_content.interrupted:
                     m.log("Receiver: GEMINI INTERRUPTED signal received.")
@@ -171,6 +221,13 @@ async def receive_from_gemini(session, aq):
                     await asyncio.sleep(0.1)
                     interrupt_signal.clear()
                     m.echo("§eReady for new command.")
+                
+                # Check for audio content to ensure it's not a turn-ending message
+                if response.server_content.model_turn:
+                    for part in response.server_content.model_turn.parts:
+                        if part.inline_data:
+                            # Process model audio if we wanted to hear it
+                            pass
             
             if response.tool_call:
                 m.log(f"Receiver: Tool calls received: {[fc.name for fc in response.tool_call.function_calls]}")
@@ -178,8 +235,11 @@ async def receive_from_gemini(session, aq):
                     task = asyncio.create_task(handle_tool_call(session, fc, aq))
                     active_tool_tasks.add(task)
                     task.add_done_callback(active_tool_tasks.discard)
+        m.log("Receiver: Loop ended naturally.")
     except Exception as e:
         m.log(f"Receiver Error: {e}")
+    finally:
+        m.log("Receiver: Loop task exiting.")
 
 async def run_websocket():
     aq = asyncio.Queue()
@@ -195,22 +255,52 @@ async def run_websocket():
                 except: pass
     if not api_key: m.echo("§cKey Error."); return
 
+    # Initial Scan
+    m.echo("§7Scanning nearby blocks...")
+    nearby_blocks = get_nearby_interesting_blocks()
+    if nearby_blocks:
+        m.echo(f"§bDetected: {', '.join(nearby_blocks)}")
+    else:
+        m.echo("§eNo interesting blocks nearby.")
+
     client = genai.Client(api_key=api_key, http_options={'api_version': 'v1alpha'})
     tools = [types.Tool(function_declarations=[
-        types.FunctionDeclaration(name="find_nearby_blocks", description="Get log coordinates.", parameters=types.Schema(type="OBJECT", properties={})),
+        types.FunctionDeclaration(name="equip_item", description="Select tool in hotbar.", parameters=types.Schema(type="OBJECT", properties={"item_name":types.Schema(type="STRING")}, required=["item_name"])),
+        types.FunctionDeclaration(name="find_nearby_blocks", description="Get coordinates of specific block types.", parameters=types.Schema(type="OBJECT", properties={"block_type":types.Schema(type="STRING")}, required=["block_type"])),
         types.FunctionDeclaration(name="move_to", description="Walk to coord.", parameters=types.Schema(type="OBJECT", properties={"x":types.Schema(type="NUMBER"),"y":types.Schema(type="NUMBER"),"z":types.Schema(type="NUMBER")}, required=["x","y","z"])),
-        types.FunctionDeclaration(name="chop_at", description="Break log at coord.", parameters=types.Schema(type="OBJECT", properties={"x":types.Schema(type="NUMBER"),"y":types.Schema(type="NUMBER"),"z":types.Schema(type="NUMBER"),"duration":types.Schema(type="NUMBER")}, required=["x","y","z"])),
+        types.FunctionDeclaration(name="chop_at", description="Break block at coord.", parameters=types.Schema(type="OBJECT", properties={"x":types.Schema(type="NUMBER"),"y":types.Schema(type="NUMBER"),"z":types.Schema(type="NUMBER"),"duration":types.Schema(type="NUMBER")}, required=["x","y","z"])),
         types.FunctionDeclaration(name="stop", description="Emergency stop.", parameters=types.Schema(type="OBJECT", properties={}))
     ])]
     
-    prompt = "You are a silent Minecraft bot. Clear the trunk completely. 1. find_nearby_blocks. 2. move_to then chop_at. 3. Re-scan and repeat until NO blocks are found. If the user talks, listen carefully and change your plan immediately. Always use tools to complete the goal."
+    nearby_str = f"Nearby interesting blocks: {', '.join(nearby_blocks)}" if nearby_blocks else "No interesting blocks detected nearby yet."
+    prompt = f"You are a silent Minecraft bot. {nearby_str}. Listen for the user's command to break one of these blocks. 1. Use equip_item to select the best tool (e.g. iron_pickaxe for ores/blocks, iron_axe for wood). 2. Use find_nearby_blocks(block_type=...) to locate the requested block. 3. move_to then chop_at. 4. Re-scan and repeat until the requested blocks are gone. If the user talks, listen carefully and change your plan immediately."
     config = types.LiveConnectConfig(tools=tools, system_instruction=types.Content(parts=[types.Part(text=prompt)]), response_modalities=["AUDIO"])
     
-    try:
-        async with client.aio.live.connect(model="gemini-3.1-flash-live-preview", config=config) as session:
-            m.echo("§aRobot Ready.")
-            await asyncio.gather(audio_stream_task(session), receive_from_gemini(session, aq), action_executor(aq))
-    except Exception as e: m.echo(f"§cError: {e}")
+    # Start the executor once, globally for this script run
+    asyncio.create_task(action_executor(aq))
+    
+    while not emergency_stop.is_set():
+        try:
+            async with client.aio.live.connect(model="gemini-3.1-flash-live-preview", config=config) as session:
+                m.echo("§aRobot Ready.")
+                m.log("Session: Connected.")
+                t1 = asyncio.create_task(audio_stream_task(session))
+                t2 = asyncio.create_task(receive_from_gemini(session, aq))
+                # Wait for either communication task to finish
+                done, pending = await asyncio.wait([t1, t2], return_when=asyncio.FIRST_COMPLETED)
+                # If one task ends, cancel the other immediately
+                for task in pending: task.cancel()
+                # Ensure pending tasks are finished canceling
+                if pending: await asyncio.gather(*pending, return_exceptions=True)
+                
+        except asyncio.CancelledError: break
+        except Exception as e:
+            m.log(f"Session Error: {e}")
+            if emergency_stop.is_set(): break
+            # Only echo Reconnecting if it wasn't a "clean" end
+            if "ping timeout" in str(e) or "internal error" in str(e):
+                m.echo("§eConnection issue. Reconnecting...")
+            await asyncio.sleep(0.5)
 
 if __name__ == "__main__":
     threading.Thread(target=monitor_emergency_stop, daemon=True).start()
