@@ -10,6 +10,31 @@ emergency_stop, interrupt_signal = threading.Event(), threading.Event()
 # Track active tool tasks
 active_tool_tasks = set()
 
+async def audio_reader(p, aq):
+    stream = None
+    try:
+        stream = p.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK)
+        m.log("Audio: Reader stream opened.")
+        while not emergency_stop.is_set():
+            data = await asyncio.to_thread(stream.read, CHUNK, exception_on_overflow=False)
+            if not data: continue
+            
+            # Maintain real-time: if queue is full, drop the oldest packet
+            if aq.full():
+                try: aq.get_nowait()
+                except: pass
+            await aq.put(data)
+    except Exception as e:
+        m.log(f"Audio Reader Error: {e}")
+    finally:
+        if stream:
+            m.log("Audio: Closing reader stream...")
+            try:
+                stream.stop_stream()
+                stream.close()
+            except: pass
+            m.log("Audio: Reader stream closed.")
+
 def get_nearby_interesting_blocks():
     try:
         px, py, pz = [int(v) for v in m.player_position()]
@@ -98,7 +123,7 @@ def do_move_to(tx, ty, tz):
         except: break
     m.player_press_forward(False)
 
-def do_chop(tx, ty, tz, duration=5.0):
+def do_chop(tx, ty, tz, duration=10.0):
     ix, iy, iz = int(tx), int(ty), int(tz)
     # Check if block still exists
     block = m.getblock(ix, iy, iz).lower()
@@ -115,11 +140,15 @@ def do_chop(tx, ty, tz, duration=5.0):
     while time.time() - start < duration:
         if interrupt_signal.is_set() or emergency_stop.is_set(): break
         # Early break if block is destroyed mid-action
-        if time.time() - start > 0.5 and "air" in m.getblock(ix, iy, iz).lower():
+        # Use a more explicit check for air to avoid finishing too early
+        current_block = m.getblock(ix, iy, iz).lower()
+        if "air" in current_block:
             break
         m.player_look_at(target_x, target_y, target_z)
         time.sleep(0.05)
     
+    # Tiny buffer to ensure the final break packet is processed
+    time.sleep(0.2)
     m.player_press_attack(False)
     m.echo("§aChop complete.")
 
@@ -148,23 +177,18 @@ def find_blocks(query):
         m.log(f"Scan Error: {e}")
         return []
 
-async def audio_stream_task(session):
-    p = pyaudio.PyAudio()
+async def audio_stream_task(aq, session):
+    # Clear stale audio data when session starts
+    while not aq.empty():
+        try: aq.get_nowait()
+        except: break
+        
     try:
-        stream = p.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK)
-        m.log("Audio: Stream opened.")
         while not emergency_stop.is_set():
-            data = await asyncio.to_thread(stream.read, CHUNK, exception_on_overflow=False)
-            if not data:
-                m.log("Audio: No data read from stream.")
-                continue
+            data = await aq.get()
             await session.send_realtime_input(audio=types.Blob(data=data, mime_type="audio/pcm;rate=16000"))
     except Exception as e:
-        m.log(f"Audio Error: {e}")
-        m.echo(f"§cAudio Error: {e}")
-    finally:
-        m.log("Audio: Terminating stream.")
-        p.terminate()
+        m.log(f"Audio Streamer Error: {e}")
 
 async def handle_tool_call(session, fc, aq):
     name, args, call_id = fc.name, fc.args, fc.id
@@ -279,28 +303,37 @@ async def run_websocket():
     # Start the executor once, globally for this script run
     asyncio.create_task(action_executor(aq))
     
-    while not emergency_stop.is_set():
-        try:
-            async with client.aio.live.connect(model="gemini-3.1-flash-live-preview", config=config) as session:
-                m.echo("§aRobot Ready.")
-                m.log("Session: Connected.")
-                t1 = asyncio.create_task(audio_stream_task(session))
-                t2 = asyncio.create_task(receive_from_gemini(session, aq))
-                # Wait for either communication task to finish
-                done, pending = await asyncio.wait([t1, t2], return_when=asyncio.FIRST_COMPLETED)
-                # If one task ends, cancel the other immediately
-                for task in pending: task.cancel()
-                # Ensure pending tasks are finished canceling
-                if pending: await asyncio.gather(*pending, return_exceptions=True)
-                
-        except asyncio.CancelledError: break
-        except Exception as e:
-            m.log(f"Session Error: {e}")
-            if emergency_stop.is_set(): break
-            # Only echo Reconnecting if it wasn't a "clean" end
-            if "ping timeout" in str(e) or "internal error" in str(e):
-                m.echo("§eConnection issue. Reconnecting...")
-            await asyncio.sleep(0.5)
+    p = pyaudio.PyAudio()
+    audio_queue = asyncio.Queue(maxsize=100)
+    # Start the persistent audio reader once
+    asyncio.create_task(audio_reader(p, audio_queue))
+    
+    try:
+        while not emergency_stop.is_set():
+            try:
+                async with client.aio.live.connect(model="gemini-3.1-flash-live-preview", config=config) as session:
+                    m.echo("§aRobot Ready.")
+                    m.log("Session: Connected.")
+                    t1 = asyncio.create_task(audio_stream_task(audio_queue, session))
+                    t2 = asyncio.create_task(receive_from_gemini(session, aq))
+                    # Wait for either communication task to finish
+                    done, pending = await asyncio.wait([t1, t2], return_when=asyncio.FIRST_COMPLETED)
+                    # If one task ends, cancel the other immediately
+                    for task in pending: task.cancel()
+                    # Ensure pending tasks are finished canceling
+                    if pending: await asyncio.gather(*pending, return_exceptions=True)
+                    
+            except asyncio.CancelledError: break
+            except Exception as e:
+                m.log(f"Session Error: {e}")
+                if emergency_stop.is_set(): break
+                # Only echo Reconnecting if it wasn't a "clean" end
+                if "ping timeout" in str(e) or "internal error" in str(e):
+                    m.echo("§eConnection issue. Reconnecting...")
+                await asyncio.sleep(0.5)
+    finally:
+        m.log("Audio: Terminating PyAudio system.")
+        p.terminate()
 
 if __name__ == "__main__":
     threading.Thread(target=monitor_emergency_stop, daemon=True).start()
