@@ -64,13 +64,13 @@ def do_move_to(tx, ty, tz):
 
 def do_chop(tx, ty, tz, duration=5.0):
     ix, iy, iz = int(tx), int(ty), int(tz)
-    # Check if log still exists
+    # Check if block still exists
     block = m.getblock(ix, iy, iz).lower()
     if "log" not in block and "wood" not in block and "stem" not in block:
-        m.echo(f"§7Log at {ix},{iy},{iz} is gone. Skipping.")
+        m.echo(f"§7Block at {ix},{iy},{iz} is gone. Skipping.")
         return
 
-    m.echo(f"§6Chopping log at {ix}, {iy}, {iz}...")
+    m.echo(f"§6Chopping block at {ix}, {iy}, {iz}...")
     target_x, target_y, target_z = float(tx) + 0.5, float(ty) + 0.5, float(tz) + 0.5
     m.player_look_at(target_x, target_y, target_z)
     m.player_press_attack(True)
@@ -78,7 +78,7 @@ def do_chop(tx, ty, tz, duration=5.0):
     start = time.time()
     while time.time() - start < duration:
         if interrupt_signal.is_set() or emergency_stop.is_set(): break
-        # Early break if log is destroyed mid-action
+        # Early break if block is destroyed mid-action
         if time.time() - start > 0.5 and "air" in m.getblock(ix, iy, iz).lower():
             break
         m.player_look_at(target_x, target_y, target_z)
@@ -87,11 +87,11 @@ def do_chop(tx, ty, tz, duration=5.0):
     m.player_press_attack(False)
     m.echo("§aChop complete.")
 
-def find_trees():
+def find_blocks():
     try:
         px, py, pz = [int(v) for v in m.player_position()]
         radius = 10
-        trees = []
+        found_blocks = []
         positions = []
         for x in range(px-radius, px+radius):
             for z in range(pz-radius, pz+radius):
@@ -102,11 +102,11 @@ def find_trees():
         for i, b_type in enumerate(block_types):
             b_lower = b_type.lower()
             if "log" in b_lower or "wood" in b_lower or "stem" in b_lower:
-                trees.append({"x": positions[i][0], "y": positions[i][1], "z": positions[i][2]})
+                found_blocks.append({"x": positions[i][0], "y": positions[i][1], "z": positions[i][2]})
         
-        sorted_trees = sorted(trees, key=lambda t: (t['x']-px)**2 + (t['y']-py)**2 + (t['z']-pz)**2)
-        m.echo(f"§bDetected {len(sorted_trees)} logs.")
-        return sorted_trees[:15]
+        sorted_blocks = sorted(found_blocks, key=lambda t: (t['x']-px)**2 + (t['y']-py)**2 + (t['z']-pz)**2)
+        m.echo(f"§bDetected {len(sorted_blocks)} blocks.")
+        return sorted_blocks[:15]
     except Exception as e:
         m.log(f"Scan Error: {e}")
         return []
@@ -126,8 +126,8 @@ async def handle_tool_call(session, fc, aq):
     name, args, call_id = fc.name, fc.args, fc.id
     res_body = {"status": "ok"}
     try:
-        if name == "find_nearby_trees":
-            res_body["trees"] = find_trees()
+        if name == "find_nearby_blocks":
+            res_body["blocks"] = find_blocks()
         elif name == "move_to":
             fut = asyncio.get_event_loop().create_future()
             await aq.put((do_move_to, (args['x'], args['y'], args['z']), {}, fut))
@@ -143,7 +143,6 @@ async def handle_tool_call(session, fc, aq):
                 try: aq.get_nowait(); aq.task_done()
                 except asyncio.QueueEmpty: break
     except asyncio.CancelledError:
-        # Don't send a response if cancelled, or send an interrupted status
         return
     except Exception as e:
         res_body = {"status": "error", "message": str(e)}
@@ -198,13 +197,13 @@ async def run_websocket():
 
     client = genai.Client(api_key=api_key, http_options={'api_version': 'v1alpha'})
     tools = [types.Tool(function_declarations=[
-        types.FunctionDeclaration(name="find_nearby_trees", description="Get log coordinates.", parameters=types.Schema(type="OBJECT", properties={})),
+        types.FunctionDeclaration(name="find_nearby_blocks", description="Get log coordinates.", parameters=types.Schema(type="OBJECT", properties={})),
         types.FunctionDeclaration(name="move_to", description="Walk to coord.", parameters=types.Schema(type="OBJECT", properties={"x":types.Schema(type="NUMBER"),"y":types.Schema(type="NUMBER"),"z":types.Schema(type="NUMBER")}, required=["x","y","z"])),
         types.FunctionDeclaration(name="chop_at", description="Break log at coord.", parameters=types.Schema(type="OBJECT", properties={"x":types.Schema(type="NUMBER"),"y":types.Schema(type="NUMBER"),"z":types.Schema(type="NUMBER"),"duration":types.Schema(type="NUMBER")}, required=["x","y","z"])),
         types.FunctionDeclaration(name="stop", description="Emergency stop.", parameters=types.Schema(type="OBJECT", properties={}))
     ])]
     
-    prompt = "You are a silent Minecraft bot. Clear the tree trunk completely. 1. find_nearby_trees. 2. move_to then chop_at. 3. Re-scan and repeat until NO logs are found. If the user talks, listen carefully and change your plan immediately. Always use tools to complete the goal."
+    prompt = "You are a silent Minecraft bot. Clear the trunk completely. 1. find_nearby_blocks. 2. move_to then chop_at. 3. Re-scan and repeat until NO blocks are found. If the user talks, listen carefully and change your plan immediately. Always use tools to complete the goal."
     config = types.LiveConnectConfig(tools=tools, system_instruction=types.Content(parts=[types.Part(text=prompt)]), response_modalities=["AUDIO"])
     
     try:
